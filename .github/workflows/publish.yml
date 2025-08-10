@@ -7,6 +7,18 @@ on:
           description: 'Key Password'
           required: true
           type: string
+        repositoryAuthor:
+          description: "Repository Author"
+          default: "wyrdough"
+          type: string
+        repositoryName:
+          description: "Repository Name"
+          default: "YARC-Launcher"
+          type: string
+        repositoryBranch:
+          description: "Repository Branch"
+          default: "master"
+          type: string
 
 jobs:
   build-tauri:
@@ -26,6 +38,9 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: nschloe/action-cached-lfs-checkout@v1.2.1
+        with:
+          repository: ${{ inputs.repositoryAuthor }}/${{ inputs.repositoryName }}
+          ref: ${{ inputs.repositoryBranch }}
       - name: setup node
         uses: actions/setup-node@v3
         with:
