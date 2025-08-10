@@ -19,6 +19,10 @@ on:
           description: "Repository Branch"
           default: "master"
           type: string
+        versionPostfix:
+          description: "Version Postfix"
+          default: ""
+          type: string
 
 jobs:
   build-tauri:
@@ -63,8 +67,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.keyPassword }}
         with:
-          tagName: v__VERSION__-22.04
-          releaseName: 'YARC Launcher v__VERSION__-22.04'
+          tagName: v__VERSION__${{ inputs.versionPostfix }}
+          releaseName: 'YARC Launcher v__VERSION__${{ inputs.VersionPostfix}}'
           releaseBody: 'See the assets to download this version and install.'
           releaseDraft: true
           prerelease: false
