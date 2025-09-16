@@ -11,6 +11,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use tempfile::NamedTempFile;
 use clap::Parser;
 use directories::BaseDirs;
 use minisign::{PublicKeyBox, SignatureBox};
@@ -25,6 +26,17 @@ RWSB28HEvrtuwvPn3pweVBodgVi/d+UH22xDsL3K8VBgeRqaIrDdTvps
 
 static COMMAND_LINE_ARG_LAUNCH: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
+
+#[tauri::command]
+fn is_msvcp_install_required() -> bool {
+    #[cfg(not(windows))]
+    return false;
+    #[cfg(windows)]
+    return unsafe {
+        windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::w!("msvcp140.dll"))
+            .map_or(true, |h| h.is_invalid())
+    };
+}
 
 #[tauri::command(async)]
 fn get_important_dirs() -> Result<ImportantDirs, String> {
@@ -50,11 +62,11 @@ fn get_important_dirs() -> Result<ImportantDirs, String> {
     std::fs::create_dir_all(&temp_folder)
         .map_err(|e| format!("Failed to create temp directory.\n{:?}", e))?;
 
-    return Ok(ImportantDirs {
+    Ok(ImportantDirs {
         yarc_folder: path_to_string(yarc_folder)?,
         launcher_folder: path_to_string(launcher_folder)?,
         temp_folder: path_to_string(temp_folder)?,
-    });
+    })
 }
 
 #[tauri::command(async)]
@@ -67,17 +79,23 @@ fn get_custom_dirs(download_location: String) -> Result<CustomDirs, String> {
     let mut setlist_folder = PathBuf::from(&download_location);
     setlist_folder.push("Setlists");
 
+    let mut venue_folder = PathBuf::from(&download_location);
+    venue_folder.push("Venues");
+
     // Create the directories if they don't exist
 
     std::fs::create_dir_all(&yarg_folder)
         .map_err(|e| format!("Failed to create YARG directory.\n{:?}", e))?;
     std::fs::create_dir_all(&setlist_folder)
         .map_err(|e| format!("Failed to create setlist directory.\n{:?}", e))?;
+    std::fs::create_dir_all(&venue_folder)
+        .map_err(|e| format!("Failed to create venue directory.\n{:?}", e))?;
 
-    return Ok(CustomDirs {
+    Ok(CustomDirs {
         yarg_folder: path_to_string(yarg_folder)?,
         setlist_folder: path_to_string(setlist_folder)?,
-    });
+        venue_folder: path_to_string(venue_folder)?,
+    })
 }
 
 #[tauri::command]
@@ -110,18 +128,73 @@ fn profile_folder_state(path: String, wanted_tag: String) -> ProfileFolderState 
         let tag = fs::read_to_string(tag_file);
         if let Ok(tag_string) = tag {
             if tag_string.trim() == wanted_tag {
-                return ProfileFolderState::UpToDate;
+                ProfileFolderState::UpToDate
             } else {
-                return ProfileFolderState::UpdateRequired;
+                ProfileFolderState::UpdateRequired
             }
         } else {
             println!("Failed to read tag file at `{}`", path);
-            return ProfileFolderState::Error;
+            ProfileFolderState::Error
         }
     } else {
         println!("Failed to find if the profile exists at `{}`", path);
-        return ProfileFolderState::Error;
+        ProfileFolderState::Error
     }
+}
+
+#[tauri::command(async)]
+async fn download_and_install_msvc(
+    handle: AppHandle
+) -> Result<(), String> {
+    // Create a temporary file for the installer to be downloaded to
+    let temp_file = NamedTempFile::new()
+        .map_err(|e| format!("Failed to create temporary file: {:?}", e))?;
+
+    // I'm hardcoding the URL here so there is zero chance of it somehow getting changed and
+    // causing us to execute something we didn't intend
+    let url = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+
+    let _ = handle.emit(
+        "progress_info",
+        ProgressPayload {
+            state: "downloading".to_string(),
+            current: 0,
+            total: 1,
+        },
+    );
+
+    download(
+        Some(&handle),
+        url,
+        &temp_file.path(),
+        1,
+        0,
+    ).await
+        .map_err(|e| format!("Failed to download MSVC installer: {}", e))?;
+
+
+    let _ = handle.emit(
+        "progress_info",
+        ProgressPayload {
+            state: "installing".to_string(),
+            current: 1,
+            total: 1,
+        },
+    );
+
+    let temp_path = temp_file.into_temp_path();
+
+    // Now execute the installer
+    let status = Command::new(&temp_path)
+        .args(["/install", "/passive", "/norestart"])
+        .status()
+        .map_err(|e| format!("Failed to execute MSVC installer: {}", e))?;
+
+    if !status.success() {
+        return Err(format!("Failed to install MSVC redistributable: {:?}", status.code()));
+    }
+
+    Ok(())
 }
 
 // when i was getting disk space in rust i used "free_space" from the fs2 crate because it takes a path and works out what drive that would be
@@ -151,7 +224,7 @@ async fn download_and_install_profile(
     let current_os = std::env::consts::OS.to_string();
     for c in content {
         // Skip release content that is not for this OS
-        if !c.platforms.iter().any(|i| i.to_owned() == current_os) {
+        if !c.platforms.contains(&current_os) {
             continue;
         }
 
@@ -184,7 +257,7 @@ async fn download_and_install_profile(
                 );
 
                 // Download sig file (don't pass app so it doesn't emit an update)
-                download(None, &sig_url, &sig_file, 0, 0).await?;
+                download(None, sig_url, &sig_file, 0, 0).await?;
 
                 // Convert public key
                 let pk_box = PublicKeyBox::from_string(YARG_PUB_KEY).unwrap();
@@ -214,6 +287,8 @@ async fn download_and_install_profile(
 
             if file.file_type == "zip" {
                 extract(&temp_file, &install_path)?;
+            } else if file.file_type == "7z" {
+                extract_7z(&temp_file, &install_path)?;
             } else if file.file_type == "encrypted" {
                 extract_encrypted(&temp_file, &install_path)?;
             } else {
@@ -263,17 +338,22 @@ fn launch_profile(
     path.push(exec_path);
 
     if !use_obs_vkcapture {
-        Command::new(path).args(arguments).spawn().map_err(|e| {
-            format!(
-                "Failed to launch profile! Is the executable installed?\n{:?}",
-                e
-            )
-        })?;
+        Command::new(path)
+            .args(arguments)
+            .env_remove("LD_LIBRARY_PATH")
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "Failed to launch profile! Is the executable installed?\n{:?}",
+                    e
+                )
+            })?;
     } else {
         let path_str = path_to_string(path)?;
 
         Command::new("obs-gamecapture")
             .args([path_str].iter().chain(&arguments))
+            .env_remove("LD_LIBRARY_PATH")
             .spawn()
             .map_err(|e| format!("Failed to launch profile! Is the executable installed? Is obs-vkcapture installed and pathed?\n{:?}", e))?;
     }
@@ -295,7 +375,7 @@ fn open_folder_profile(profile_path: String) -> Result<(), String> {
 #[tauri::command(async)]
 fn get_launch_argument() -> Option<String> {
     let launch_arg = COMMAND_LINE_ARG_LAUNCH.lock().unwrap();
-    return launch_arg.to_owned();
+    launch_arg.to_owned()
 }
 
 #[tauri::command(async)]
@@ -342,10 +422,12 @@ fn main() {
             is_connected_to_internet,
             profile_folder_state,
             download_and_install_profile,
+            download_and_install_msvc,
             uninstall_profile,
             launch_profile,
             open_folder_profile,
             get_launch_argument,
+            is_msvcp_install_required,
             clean_up_old_install
         ])
         .setup(|app| {
@@ -358,4 +440,12 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("Error while running Tauri application.");
+}
+
+#[cfg(test)]
+mod t {
+    #[test]
+    fn test_msvcp_installed() {
+        println!("{}", super::is_msvcp_install_required());
+    }
 }
